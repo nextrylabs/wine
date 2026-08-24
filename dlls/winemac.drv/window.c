@@ -198,7 +198,12 @@ struct macdrv_win_data *get_win_data(HWND hwnd)
     if (!hwnd) return NULL;
     pthread_mutex_lock(&win_data_mutex);
     if (win_datas && (data = (struct macdrv_win_data*)CFDictionaryGetValue(win_datas, hwnd)))
+    {
+        /* BBX: keep the DXMT-facing 0x18 field current with the live client view,
+         * from the single point every reader goes through. */
+        data->client_cocoa_view = data->client_view;
         return data;
+    }
     pthread_mutex_unlock(&win_data_mutex);
     return NULL;
 }
@@ -213,6 +218,50 @@ void release_win_data(struct macdrv_win_data *data)
 {
     if (data) pthread_mutex_unlock(&win_data_mutex);
 }
+
+
+/***********************************************************************
+ *              macdrv_functions
+ *
+ * A vtable of winemac.drv internals reached by dlsym(RTLD_DEFAULT,
+ * "macdrv_functions") from a sibling unix module — the shape DXMT's
+ * winemetal.so expects (src/winemetal/unix/winemetal_unix.c). The member order
+ * and count match its struct macdrv_functions_t exactly so the offsets DXMT
+ * reads line up; only the members it dereferences — get_win_data,
+ * release_win_data, and the three macdrv_view_* Metal-view calls — carry a real
+ * function, the rest hold their slot with NULL. Exported with default
+ * visibility against this module's -fvisibility=hidden; nothing else here
+ * becomes visible. Pairs with the client_cocoa_view field reinstated in
+ * struct macdrv_win_data so DXMT's read at offset 0x18 lands on the live view.
+ */
+struct macdrv_functions_layout
+{
+    void *macdrv_init_display_devices;
+    struct macdrv_win_data *(*get_win_data)(HWND hwnd);
+    void (*release_win_data)(struct macdrv_win_data *data);
+    void *macdrv_get_cocoa_window;
+    void *macdrv_create_metal_device;
+    void *macdrv_release_metal_device;
+    macdrv_metal_view (*macdrv_view_create_metal_view)(macdrv_view v, macdrv_metal_device d);
+    macdrv_metal_layer (*macdrv_view_get_metal_layer)(macdrv_metal_view v);
+    void (*macdrv_view_release_metal_view)(macdrv_metal_view v);
+    void *on_main_thread;
+};
+
+__attribute__((visibility("default")))
+struct macdrv_functions_layout macdrv_functions =
+{
+    NULL,
+    get_win_data,
+    release_win_data,
+    NULL,
+    NULL,
+    NULL,
+    macdrv_view_create_metal_view,
+    macdrv_view_get_metal_layer,
+    macdrv_view_release_metal_view,
+    NULL,
+};
 
 
 /***********************************************************************

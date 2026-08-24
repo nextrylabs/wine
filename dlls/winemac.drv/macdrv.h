@@ -179,6 +179,7 @@ struct macdrv_win_data
     HWND                hwnd;                   /* hwnd that this private data belongs to */
     macdrv_window       cocoa_window;
     macdrv_view         client_view;
+    macdrv_view         client_cocoa_view;      /* BBX: held at offset 0x18 for the macdrv_win_data layout DXMT's winemetal.so reads; mirrors client_view, kept current in get_win_data */
     struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
     int                 pixel_format;           /* pixel format for GL */
     HANDLE              drag_event;             /* event to signal that Cocoa-driven window dragging has ended */
