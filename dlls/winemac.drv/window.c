@@ -290,6 +290,24 @@ static struct macdrv_win_data *get_win_data_with_client_view(HWND hwnd)
     return data;
 }
 
+/* The consumer does not parse this struct — it reads the client view at a fixed
+ * byte offset, so a field reordered above it turns into a silently wrong pointer
+ * rather than a compile error. That is precisely how 6471a42 broke it. Assert
+ * the offset the pinned consumer expects, and the whole prefix of fields it
+ * walks past to get there, so any future reshuffle fails the build loudly. */
+C_ASSERT(offsetof(struct macdrv_win_data, hwnd)              == 0x00);
+C_ASSERT(offsetof(struct macdrv_win_data, cocoa_window)      == 0x08);
+C_ASSERT(offsetof(struct macdrv_win_data, client_view)       == 0x10);
+C_ASSERT(offsetof(struct macdrv_win_data, client_cocoa_view) == 0x18);
+
+/* Same reasoning for the vtable: the consumer indexes it by position. */
+C_ASSERT(offsetof(struct macdrv_functions_layout, get_win_data)                 == 0x08);
+C_ASSERT(offsetof(struct macdrv_functions_layout, release_win_data)             == 0x10);
+C_ASSERT(offsetof(struct macdrv_functions_layout, macdrv_view_create_metal_view) == 0x30);
+C_ASSERT(offsetof(struct macdrv_functions_layout, macdrv_view_get_metal_layer)  == 0x38);
+C_ASSERT(offsetof(struct macdrv_functions_layout, macdrv_view_release_metal_view) == 0x40);
+C_ASSERT(sizeof(struct macdrv_functions_layout)                                 == 0x50);
+
 __attribute__((visibility("default")))
 struct macdrv_functions_layout macdrv_functions =
 {

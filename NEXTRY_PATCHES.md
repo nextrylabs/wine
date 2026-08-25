@@ -57,6 +57,7 @@ form of this work rebased onto `wine-10.0`.
      a promotion and never a second load.
   5. The vtable's `get_win_data` creates the client Cocoa view on demand for that
      caller alone, so no window pays for a view it never uses.
+  6. Static assertions pin both layouts the consumer indexes by offset.
 - **Tests.** Measured on Apple M4 Max / macOS 26.5.1, Wine 11.0, DXMT v0.80
   installed as builtin, in an Aqua session.
   - Symbol: `nm winemac.so` → `D _macdrv_functions`.
@@ -70,11 +71,24 @@ form of this work rebased onto `wine-10.0`.
   - Control: the same client on the same tree with an unpatched `winemac.so`
     still aborts with the message above, so the pass is attributable to this
     patch and not to the environment around it.
-- **Scope, stated precisely.** This fixes windowed D3D11 presentation. It is
-  *not* what makes an offscreen compositor reach the GPU: a Chromium/ANGLE client
-  rendering offscreen never calls `CreateMetalViewFromHWND`, and was measured to
-  reach hardware with and without this patch once its translation layer was
-  installed correctly. Both results are real; they are different halves.
+  - Layout: `C_ASSERT` on `offsetof` for all four struct fields and six vtable
+    slots, so a future reshuffle fails the build instead of silently handing the
+    consumer a wrong pointer — which is exactly how `6471a42` broke this. Negative
+    control: asserting `0x20` instead of `0x18` fails the build, so the assertion
+    is not vacuous.
+- **Scope, stated precisely — and one claim withdrawn.** This fixes D3D11
+  presentation **for a process presenting to its own window**. That is measured.
+  It does **not** make a browser-architecture client reach the GPU. An earlier
+  revision of this ledger said such a client "was measured to reach hardware";
+  **that is withdrawn.** It was read while the macOS session was locked, so no
+  window existed and nothing had asked for a swapchain. Re-measured with a window
+  present, Chromium falls back to software (`gpu_compositing: disabled_software`,
+  window pure black) because DXMT refuses the swapchain outright:
+  `src/d3d11/d3d11_swapchain.cpp:1099` returns `E_FAIL` with "cross-process
+  swapchain not supported yet" when the `HWND` belongs to another process, which
+  is precisely Chromium's browser/GPU-process split. That rejection happens
+  *before* any Metal view is requested, so this patch cannot reach it and never
+  could. Fixing it is upstream DXMT work, not a winemac.drv change.
 - **Upstream PR.** Not yet submitted (§4.6 obligation open). Patches 3 and 4 —
   a defined accessor for out-of-module Metal-view access — are the
   contribution-worthy part. Patches 1 and 2 are a fork-local compatibility shim
