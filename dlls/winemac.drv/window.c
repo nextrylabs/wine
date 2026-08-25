@@ -27,6 +27,7 @@
 
 #include "config.h"
 
+#include <dlfcn.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #define GetCurrentThread Mac_GetCurrentThread
 #define LoadResource Mac_LoadResource
@@ -200,8 +201,10 @@ struct macdrv_win_data *get_win_data(HWND hwnd)
     if (win_datas && (data = (struct macdrv_win_data*)CFDictionaryGetValue(win_datas, hwnd)))
     {
         /* BBX: keep the DXMT-facing 0x18 field current with the live client view,
-         * from the single point every reader goes through. */
-        data->client_cocoa_view = data->client_view;
+         * from the single point every reader goes through. Only when one exists —
+         * a NULL client_view must not erase a view created on demand for an
+         * out-of-module renderer, which owns the field the rest of the time. */
+        if (data->client_view) data->client_cocoa_view = data->client_view;
         return data;
     }
     pthread_mutex_unlock(&win_data_mutex);
@@ -248,11 +251,50 @@ struct macdrv_functions_layout
     void *on_main_thread;
 };
 
+/***********************************************************************
+ *              get_win_data_with_client_view
+ *
+ * The vtable's get_win_data. An out-of-module renderer asks for a window's
+ * data in order to wrap its client Cocoa view in a Metal view, but since
+ * 6471a42 winemac.drv only has a client view once a client surface has
+ * presented through it — and a renderer that bypasses Wine's own D3D never
+ * creates one, so the field is NULL exactly when it is needed. Wine 9/10 did
+ * not have this problem because create_client_cocoa_view built the view up
+ * front; this restores that guarantee for this caller alone, on demand, so no
+ * window pays for a view it never uses.
+ */
+static void ensure_client_cocoa_view(struct macdrv_win_data *data)
+{
+    RECT rect = data->rects.client;
+
+    if (!data->cocoa_window) return;
+    OffsetRect(&rect, -data->rects.visible.left, -data->rects.visible.top);
+
+    if (data->client_cocoa_view)
+        macdrv_set_view_frame(data->client_cocoa_view, cgrect_from_rect(rect));
+    else
+    {
+        if (!(data->client_cocoa_view = macdrv_create_view(cgrect_from_rect(rect)))) return;
+        macdrv_set_view_hidden(data->client_cocoa_view, FALSE);
+    }
+    macdrv_set_view_superview(data->client_cocoa_view, NULL, data->cocoa_window, NULL, NULL);
+}
+
+static struct macdrv_win_data *get_win_data_with_client_view(HWND hwnd)
+{
+    struct macdrv_win_data *data = get_win_data(hwnd);
+
+    if (data) ensure_client_cocoa_view(data);
+    TRACE("hwnd %p -> data %p client_cocoa_view %p\n",
+          hwnd, data, data ? data->client_cocoa_view : NULL);
+    return data;
+}
+
 __attribute__((visibility("default")))
 struct macdrv_functions_layout macdrv_functions =
 {
     NULL,
-    get_win_data,
+    get_win_data_with_client_view,
     release_win_data,
     NULL,
     NULL,
@@ -262,6 +304,31 @@ struct macdrv_functions_layout macdrv_functions =
     macdrv_view_release_metal_view,
     NULL,
 };
+
+
+/***********************************************************************
+ *              promote_macdrv_functions
+ *
+ * Exporting the vtable is necessary but not sufficient. ntdll opens every unix
+ * module with plain RTLD_NOW (dlls/ntdll/unix/loader.c), which on macOS means
+ * RTLD_LOCAL, and dlsym(RTLD_DEFAULT, ...) explicitly skips images opened that
+ * way — so the consumer's lookup still returns NULL even though the symbol is
+ * present in the file. Re-opening this image by its own path with RTLD_GLOBAL
+ * promotes the already-resident copy into the global namespace, which is what
+ * actually makes the export reachable. RTLD_NOLOAD keeps this a promotion and
+ * never a second load: if the image were somehow not resident, dlopen returns
+ * NULL and nothing changes. The handle is retained so the promotion outlives
+ * this function.
+ */
+static void *macdrv_global_handle;
+
+static void __attribute__((constructor)) promote_macdrv_functions(void)
+{
+    Dl_info info;
+
+    if (dladdr(&macdrv_functions, &info) && info.dli_fname)
+        macdrv_global_handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+}
 
 
 /***********************************************************************
