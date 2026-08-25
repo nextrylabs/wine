@@ -89,10 +89,70 @@ form of this work rebased onto `wine-10.0`.
   is precisely Chromium's browser/GPU-process split. That rejection happens
   *before* any Metal view is requested, so this patch cannot reach it and never
   could. Fixing it is upstream DXMT work, not a winemac.drv change.
+  *(Amended 2026-08-25: half of that last sentence fell. The cross-process
+  rejection itself is still upstream DXMT work, but it can be sidestepped by
+  running the client's GPU thread in the window-owning process
+  (`--in-process-gpu`) — and once it is, a second, winemac.drv-side gap appears
+  and is closed by NEXTRY-WINE-0002 below. The combination is measured working
+  for the Steam client.)*
 - **Upstream PR.** Not yet submitted (§4.6 obligation open). Patches 3 and 4 —
   a defined accessor for out-of-module Metal-view access — are the
   contribution-worthy part. Patches 1 and 2 are a fork-local compatibility shim
   for the consumer's current offset assumption and are unlikely to land as-is.
+
+### NEXTRY-WINE-0002 — winemac: serve a child HWND its toplevel's client view
+
+- **Platform:** macOS (x86_64 lane; same DXMT consumer as NEXTRY-WINE-0001).
+- **Component:** `dlls/winemac.drv` (`window.c` only; no header or layout change).
+- **Symptom.** A multi-process browser client (the Steam client's CEF, Chromium
+  126) run with its GPU thread in the window-owning process — `--in-process-gpu`,
+  the only configuration DXMT's cross-process guard admits — still dies in the
+  same "Failed to create metal view" `abort()` that 0001 removed for ordinary
+  titles. The browser process then wedges mid-teardown: Chromium's threads are
+  gone, the Cocoa loop keeps pumping, and the client shows no window at all.
+- **Rationale.** Chromium's compositor presents to a **child** HWND. winemac
+  gives children `win_data` but never a Cocoa window — `macdrv_create_win_data`
+  builds an NSWindow only when the parent is the desktop — so 0001's on-demand
+  view path finds nothing to attach a view to and returns it NULL, which the
+  consumer treats as fatal. A child's pixels land on its toplevel's surface
+  anyway under winemac; the view the renderer needs is the root's.
+- **Change.** The vtable's `get_win_data` resolves any HWND whose data lacks a
+  Cocoa window (children; windowless cases) to `NtUserGetAncestor(hwnd, GA_ROOT)`
+  and serves the root's client view, created on demand as in 0001. Lock
+  discipline: `get_win_data` returns holding the global `win_data` mutex, so the
+  first lookup is released before the root lookup — re-locking would deadlock.
+  Plus a one-line diagnostic at this exact decision point, emitted only when
+  `BBX_MACDRV_DIAG` is set, because this is where "no view" becomes the
+  consumer's `abort()` and the macdrv TRACE channel is too coarse to leave on
+  under a full browser client.
+- **Tests.** Measured on Apple M4 Max / macOS 26.5.1, Wine 11.0 base, DXMT
+  v0.80-148-g856d9f3 as builtin, current Steam client (CEF/Chromium 126),
+  unlocked Aqua session held awake (`caffeinate -disu`), window present — the
+  admissibility discipline the 0001 withdrawal established.
+  - Resolution observed: `bbx-macdrv: metal-view lookup hwnd 0x1011e root
+    0x5010a … client_cocoa_view 0x…` — child resolved to a different root, view
+    non-NULL. A toplevel resolves to itself (probe: `hwnd 0x2004e root 0x2004e`).
+  - Client outcome, against a same-day 4-run control (identical binaries, no
+    `--in-process-gpu`): cross-process swapchain rejections 1/run → **0**;
+    `gpu_compositing` `disabled_software` → **`enabled`** across 13 consecutive
+    CDP samples; `glRenderer` names `ANGLE (Apple, Apple M4 Max … Direct3D11
+    vs_5_0 ps_5_0)`; the on-screen 705×440 login window measures
+    `distinct_rgb=1116, mean_luma≈58.3, frac_luma_gt8=1.0` where the control is
+    a pure black window (`distinct_rgb=1, mean_luma=0.00`) or none at all. No
+    separate GPU process exists in the tree, no SwiftShader process appears, and
+    no GPU-disable token is present.
+  - Regression: the 0001 own-window probe still passes on this build
+    (`D3D11CreateDeviceAndSwapChain hr=0`, `FEATURE_LEVEL 11_1`, `Present hr=0`).
+- **Scope and limits, stated precisely.** All presenting children of one
+  toplevel share that toplevel's client view, and child-rect offsets are not
+  applied — correct for a compositor child that fills its window (the measured
+  case), untested for partial-area children. The `--in-process-gpu` delivery
+  mechanism is the *client's* concern and lives outside this fork (Steam's argv
+  whitelist does not forward it; BottleBox measured it via a steamwebhelper
+  wrapper). Retirement: this patch's need disappears for browser clients if
+  upstream DXMT implements cross-process presentation (their issue #151); the
+  child-to-root mapping itself remains useful for any out-of-module renderer
+  handed a child HWND.
 
 ## Operational note (not a patch)
 

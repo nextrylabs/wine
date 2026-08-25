@@ -283,8 +283,37 @@ static void ensure_client_cocoa_view(struct macdrv_win_data *data)
 static struct macdrv_win_data *get_win_data_with_client_view(HWND hwnd)
 {
     struct macdrv_win_data *data = get_win_data(hwnd);
+    HWND root = hwnd;
 
+    /* A child window has win_data but never a Cocoa window — winemac only
+     * builds NSWindows for toplevels (macdrv_create_win_data), and a child's
+     * pixels land on its toplevel's surface anyway. A renderer presenting to a
+     * child HWND (Chromium's compositor does exactly this) therefore gets the
+     * root's client view: same surface its pixels were always destined for.
+     * get_win_data returns holding the global win_data mutex, so the first
+     * lookup must be released before the root lookup — re-locking deadlocks. */
+    if (data && !data->cocoa_window)
+    {
+        release_win_data(data);
+        data = NULL;
+    }
+    if (!data)
+    {
+        root = NtUserGetAncestor(hwnd, GA_ROOT);
+        if (root && root != hwnd) data = get_win_data(root);
+        if (data && !data->cocoa_window)
+        {
+            release_win_data(data);
+            data = NULL;
+        }
+    }
     if (data) ensure_client_cocoa_view(data);
+    /* One line per swapchain-creation attempt, on request only: this is the
+     * exact point where "no view" turns into the consumer's abort(), and the
+     * usual WINEDEBUG channels are too coarse to leave on in a full client. */
+    if (getenv("BBX_MACDRV_DIAG"))
+        fprintf(stderr, "bbx-macdrv: metal-view lookup hwnd %p root %p data %p cocoa_window %p client_cocoa_view %p\n",
+                hwnd, root, data, data ? data->cocoa_window : NULL, data ? data->client_cocoa_view : NULL);
     TRACE("hwnd %p -> data %p client_cocoa_view %p\n",
           hwnd, data, data ? data->client_cocoa_view : NULL);
     return data;
