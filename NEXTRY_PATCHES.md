@@ -154,6 +154,71 @@ form of this work rebased onto `wine-10.0`.
   child-to-root mapping itself remains useful for any out-of-module renderer
   handed a child HWND.
 
+### NEXTRY-WINE-0003 — ntdll: append env-declared arguments to a multi-process app's main process
+
+- **Platform:** cross-platform mechanism; the reason it exists is the macOS DXMT lane.
+- **Component:** `dlls/ntdll/unix` (`process.c` only).
+- **Symptom / need.** A multi-process client whose GPU-hosting helper needs a
+  command-line flag the parent does not forward has no declarative way to add
+  it. The concrete case: Steam's `steam.exe` spawns `steamwebhelper.exe` with a
+  fixed argv whitelist carrying no `--in-process-gpu` and no `--use-angle` (read
+  from the binary), so the CEF compositor cannot be routed onto the same-process
+  swapchain path DXMT requires (see NEXTRY-WINE-0002 and the DXMT cross-process
+  guard). The only prior lever was to replace `steamwebhelper.exe` with a wrapper
+  *inside Steam's install tree* — which a Steam self-update or integrity-repair
+  pass overwrites, silently returning the client to software rendering.
+- **Why ntdll and not kernelbase — measured, not assumed.** An earlier draft of
+  this patch hooked `kernelbase!CreateProcessInternalW`. Instrumentation showed
+  that path sees all six of Steam's `--type=`-tagged CEF *sub*-processes but
+  **never the `--type=`-less browser process** — Steam launches the browser
+  bypassing the Win32 CreateProcess layer (a direct `NtCreateUserProcess`), so a
+  kernelbase hook flags exactly the wrong processes and misses the one that
+  matters. `NtCreateUserProcess` in the ntdll unix backend is the one funnel
+  every launch — Win32 or direct-syscall — passes through: instrumentation
+  confirmed it sees the browser (`--type` absent) *and* the children, and that a
+  `BBX_`-prefixed launch-environment variable propagates to it across wine-child
+  hops.
+- **Change.** `bbx_build_appended_cmdline`, called at the single point where the
+  child command line is serialized into its startup info (`create_startup_info`),
+  reads two launch-environment variables — `BBX_WINE_APPEND_TARGET` (a child exe
+  basename) and `BBX_WINE_APPEND_ARGS` (the arguments) — and, when the spawn's
+  image basename matches the target **and** its command line carries no
+  `--type=` marker (i.e. the *main* process of a Chromium/CEF-style app, not a
+  sub-process) **and** the arguments are not already present, appends them. The
+  appended command line is swapped in only for the `create_startup_info` call and
+  the caller's `UNICODE_STRING` is restored immediately after, so the caller's
+  own teardown is untouched and nothing leaks. The env vars are unset by default,
+  so the fast path is two `getenv()`s and a return — no behavioural change for
+  anyone who has not opted in.
+- **Where the policy lives (§4.5 boundary).** The fork carries only the generic
+  mechanism "append env-declared args to the main process of a named multi-process
+  app". The concrete policy — that `steamwebhelper.exe` gets `--in-process-gpu` —
+  is data BottleBox places in the launch environment (`GameProfile.env_overrides`),
+  outside the fork. No store name, product logic, or selection heuristic is in
+  this patch; the `--type=` skip is generic Chromium-family knowledge, not
+  Steam-specific.
+- **Tests.** Apple M4 Max / macOS 26.5.1, Wine 11.0 base, DXMT builtin, unlocked
+  Aqua session, **the Valve `steamwebhelper.exe` byte-identical and under its own
+  name** (`stat` = 7,697,048, asserted before launch).
+  - Instrumented funnel census: the browser spawn (`--type` absent) is seen here
+    and carries the propagated env var; the six sub-processes carry `--type=` and
+    are correctly skipped.
+  - Steam launched with `BBX_WINE_APPEND_TARGET=steamwebhelper.exe`
+    `BBX_WINE_APPEND_ARGS=--in-process-gpu` in the environment, no wrapper: `ps`
+    shows the live browser process carrying `--in-process-gpu` that no argv on
+    `steam.exe`'s side supplied, no separate GPU process, and the same A/B
+    outcome as the earlier wrapper run — rejections → 0, `gpu_compositing
+    enabled`, on-screen login window composited. [Measured 2026-08-25;
+    decomposition doc §C.10.]
+  - Negative default: with the env vars unset, no flag appears and the client is
+    the software-fallback control, so the mechanism is inert unless opted in.
+- **Upstream.** Not offered upstream — a niche, fork-local convenience Wine is
+  unlikely to want in this form. Documented as an L3 fork addition with no
+  expected retirement (it is not fixing a regression upstream introduced). It
+  retires only if a first-class per-child launch-argument facility lands
+  upstream, or if upstream DXMT implements cross-process presentation and the
+  flag stops being needed at all.
+
 ## Operational note (not a patch)
 
 DXMT's PE modules must be installed as Wine **builtins**, which is what its

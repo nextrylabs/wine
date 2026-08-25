@@ -676,6 +676,88 @@ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_
     return STATUS_SUCCESS;
 }
 
+
+/***********************************************************************
+ *           bbx_wide_contains
+ *
+ * Case-sensitive WCHAR substring search for an ASCII needle. Used to detect
+ * Chromium's "--type=" sub-process marker and to keep the append idempotent.
+ */
+static int bbx_wide_contains( const WCHAR *hay, USHORT hay_len_bytes, const char *needle )
+{
+    SIZE_T hay_len = hay_len_bytes / sizeof(WCHAR), n = strlen( needle ), i, j;
+
+    if (!hay || !n || hay_len < n) return 0;
+    for (i = 0; i + n <= hay_len; i++)
+    {
+        for (j = 0; j < n; j++)
+            if (hay[i + j] != (WCHAR)(unsigned char)needle[j]) break;
+        if (j == n) return 1;
+    }
+    return 0;
+}
+
+/***********************************************************************
+ *           bbx_build_appended_cmdline   (BottleBox fork addition, NEXTRY-WINE-0003)
+ *
+ * Steam launches its CEF browser process (steamwebhelper.exe, no "--type=")
+ * bypassing kernelbase's CreateProcess, so a Win32-level hook never sees it;
+ * this unix funnel is the one point every launch passes through. When the host
+ * asks — by setting BBX_WINE_APPEND_TARGET (a child exe basename) and
+ * BBX_WINE_APPEND_ARGS (the arguments) in the launch environment, which is
+ * inherited across wine-child hops — this appends those arguments to the *main*
+ * process of a multi-process app: the spawn whose image basename matches and
+ * whose command line carries no "--type=" sub-process marker. That is exactly
+ * how Steam's CEF is routed onto --in-process-gpu so DXMT takes its
+ * same-process swapchain path, without touching any file in Steam's tree.
+ *
+ * The env vars are unset by default, so the fast path is two getenv()s and a
+ * return. Returns a fresh malloc'd command line on a match (caller frees),
+ * NULL otherwise. ASCII arguments only (the guest command line is UTF-16; the
+ * arguments we inject are switch names, which are ASCII).
+ */
+static WCHAR *bbx_build_appended_cmdline( const UNICODE_STRING *image, const UNICODE_STRING *cmdline )
+{
+    const char *target = getenv( "BBX_WINE_APPEND_TARGET" );
+    const char *args = getenv( "BBX_WINE_APPEND_ARGS" );
+    const WCHAR *img, *base;
+    const char *t;
+    const WCHAR *b;
+    SIZE_T cmd_len, args_len, i;
+    WCHAR *result;
+
+    if (!target || !*target || !args || !*args) return NULL;
+    if (!image->Buffer || !cmdline->Buffer) return NULL;
+
+    /* basename of the image path */
+    img = image->Buffer;
+    base = img;
+    for (i = 0; i < image->Length / sizeof(WCHAR); i++)
+        if (img[i] == '\\' || img[i] == '/') base = img + i + 1;
+
+    /* case-insensitive ASCII match of basename against the target */
+    for (b = base, t = target; *t; b++, t++)
+        if ((*b | 0x20) != ((WCHAR)(unsigned char)*t | 0x20)) return NULL;
+    if (*b) return NULL;   /* basename longer than target => not an exact match */
+
+    /* only the main process: sub-processes carry --type=, skip them */
+    if (bbx_wide_contains( cmdline->Buffer, cmdline->Length, "--type=" )) return NULL;
+    /* idempotent: never append the same args twice */
+    if (bbx_wide_contains( cmdline->Buffer, cmdline->Length, args )) return NULL;
+
+    cmd_len = cmdline->Length / sizeof(WCHAR);
+    args_len = strlen( args );
+    if (!(result = malloc( (cmd_len + 1 + args_len + 1) * sizeof(WCHAR) ))) return NULL;
+    memcpy( result, cmdline->Buffer, cmd_len * sizeof(WCHAR) );
+    result[cmd_len] = ' ';
+    for (i = 0; i < args_len; i++)
+        result[cmd_len + 1 + i] = (WCHAR)(unsigned char)args[i];
+    result[cmd_len + 1 + args_len] = 0;
+
+    ERR( "bbx: appended '%s' to %s launch\n", args, debugstr_us( image ) );
+    return result;
+}
+
 /**********************************************************************
  *           NtCreateUserProcess  (NTDLL.@)
  */
@@ -776,8 +858,29 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (is_arm64ec() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
             machine = main_image_info.Machine;
     }
-    if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
-        goto done;
+    /* BBX: the child's command line is serialized into its startup info here and
+     * nowhere else, so swap in the appended form just for this call and restore
+     * the caller's structure immediately, leaving its own teardown untouched. */
+    {
+        WCHAR *bbx_new = bbx_build_appended_cmdline( &params->ImagePathName, &params->CommandLine );
+        UNICODE_STRING bbx_saved = params->CommandLine;
+
+        if (bbx_new)
+        {
+            SIZE_T len = 0;
+            while (bbx_new[len]) len++;
+            params->CommandLine.Buffer = bbx_new;
+            params->CommandLine.Length = (USHORT)(len * sizeof(WCHAR));
+            params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+        }
+        startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size );
+        if (bbx_new)
+        {
+            params->CommandLine = bbx_saved;
+            free( bbx_new );
+        }
+    }
+    if (!startup_info) goto done;
     env_size = get_env_size( params, &winedebug );
 
     if ((status = alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;
